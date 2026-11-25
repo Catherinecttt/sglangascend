@@ -1,0 +1,328 @@
+diff --git a/python/sglang/kernels/ops/attention/qsa_gbsa_prefill.py b/python/sglang/kernels/ops/attention/qsa_gbsa_prefill.py
+index 2b93a575b3..e6c422e542 100644
+--- a/python/sglang/kernels/ops/attention/qsa_gbsa_prefill.py
++++ b/python/sglang/kernels/ops/attention/qsa_gbsa_prefill.py
+@@ -38,7 +38,7 @@ def qsa_gbsa_prefill(
+         generic_block_sparse_attention,
+         generic_block_sparse_attention_metadata,
+     )
+-    assert q.shape[1:] == (3, 256) and k.shape[1:] == (1, 256)
++    assert q.shape[1:] in ((3, 256), (6, 256)) and k.shape[1:] == (1, 256)
+     assert k.shape == v.shape and k.shape[0] % 128 == 0
+     assert q.dtype == k.dtype == v.dtype == torch.bfloat16
+     assert logical_indices.shape == (q.shape[0], 512 if indices_are_blocks else 2051)
+@@ -83,7 +83,7 @@ def qsa_gbsa_prefill(
+                    mask_mode=1, quant_mode=0, softmax_precision=0,
+                    residual_block_mode=1, is_consistent_topk=False)
+     meta = generic_block_sparse_attention_metadata(
+-        ids, counts, 3, 1, 256, [1,4], max_seqlen_q=max_query,
++        ids, counts, q.shape[1], 1, 256, [1,4], max_seqlen_q=max_query,
+         max_seqlen_kv=table.shape[1] * 128, **options)
+     output, _ = generic_block_sparse_attention(
+         q.contiguous(), k.view(-1,128,1,256), v.view(-1,128,1,256), ids,
+diff --git a/python/sglang/srt/layers/attention/qsa/graph_metadata.py b/python/sglang/srt/layers/attention/qsa/graph_metadata.py
+index 228847e341..b64e0f850e 100644
+--- a/python/sglang/srt/layers/attention/qsa/graph_metadata.py
++++ b/python/sglang/srt/layers/attention/qsa/graph_metadata.py
+@@ -83,6 +83,7 @@ def _qsa_graph_row_metadata_kernel(
+     req_to_token_row_stride,
+     max_pages,
+     RATIO: tl.constexpr,
++    RING_STRIDE: tl.constexpr,
+     FULL_PAGE: tl.constexpr,  # full-KV tokens per page
+     PAGE_BLOCK: tl.constexpr,
+     seq_lens_ptr,
+@@ -128,11 +129,11 @@ def _qsa_graph_row_metadata_kernel(
+         tl.store(write_locs_ptr + row, write_loc)
+
+         tl.store(logical_positions_ptr + row, current)
+-        tl.store(state_slots_ptr + row, req * RATIO + (current % RATIO).to(tl.int64))
++        tl.store(state_slots_ptr + row, req * RING_STRIDE + (current % RING_STRIDE).to(tl.int64))
+         ring_base = row.to(tl.int64) * RATIO
+         for k in tl.static_range(RATIO):
+             member = tl.maximum(current - (RATIO - 1 - k), 0)
+-            slot = req * RATIO + (member % RATIO).to(tl.int64)
++            slot = req * RING_STRIDE + (member % RING_STRIDE).to(tl.int64)
+             tl.store(ring_locs_ptr + ring_base + k, slot.to(tl.int32))
+
+     # Page-table entries are the request's FULL-KV page ids, read from the
+@@ -209,6 +210,7 @@ def launch_graph_metadata(
+         req_to_token.stride(0),
+         max_pages,
+         RATIO=indexer.compress_ratio,
++        RING_STRIDE=getattr(pool, "qsa_ring_stride", indexer.compress_ratio),
+         FULL_PAGE=pool.qsa_compressed_page_size * indexer.compress_ratio,
+         PAGE_BLOCK=128,
+         seq_lens_ptr=seq_lens,
+@@ -234,6 +236,7 @@ def _qsa_draft_graph_metadata_kernel(
+     num_padding,
+     MAX_PAGES: tl.constexpr,
+     RATIO: tl.constexpr,
++    RING_STRIDE: tl.constexpr,
+     FULL_PAGE: tl.constexpr,
+ ):
+     for step in tl.static_range(len(buffers)):
+@@ -252,6 +255,7 @@ def _qsa_draft_graph_metadata_kernel(
+                 row_stride,
+                 MAX_PAGES,
+                 RATIO,
++                RING_STRIDE,
+                 FULL_PAGE,
+                 128,
+                 seq_lens,
+@@ -286,12 +290,13 @@ def prepare_draft_graph_metadata(metadata, req_to_token, pool):
+         req_to_token.stride(0),
+         metadata[0].indexer_metadata.graph_compressed_page_table.shape[1],
+         pool.qsa_compress_ratio,
++        getattr(pool, "qsa_ring_stride", pool.qsa_compress_ratio),
+         pool.qsa_compressed_page_size * pool.qsa_compress_ratio,
+     )
+
+
+ def launch_draft_graph_metadata(args, seq_lens, req_pool_indices, bs, num_padding):
+-    buffers, req_to_token, row_stride, max_pages, ratio, full_page = args
++    buffers, req_to_token, row_stride, max_pages, ratio, ring_stride, full_page = args
+     if bs == 0:
+         return
+     _qsa_draft_graph_metadata_kernel[(bs, triton.cdiv(max_pages, 128), len(buffers))](
+@@ -304,6 +309,7 @@ def launch_draft_graph_metadata(args, seq_lens, req_pool_indices, bs, num_paddin
+         max(0, min(int(num_padding or 0), bs)),
+         max_pages,
+         ratio,
++        ring_stride,
+         full_page,
+         num_warps=1,
+     )
+diff --git a/python/sglang/srt/layers/attention/qsa/metadata.py b/python/sglang/srt/layers/attention/qsa/metadata.py
+index 900c39863b..3f6a37e8c0 100644
+--- a/python/sglang/srt/layers/attention/qsa/metadata.py
++++ b/python/sglang/srt/layers/attention/qsa/metadata.py
+@@ -259,14 +259,16 @@ def build_pending_ring_slots(
+     logical_positions: torch.Tensor,
+     compress_ratio: int,
+     is_extend: bool,
++    ring_stride: int | None = None,
+ ) -> torch.Tensor:
+-    """Pending-ring slot ``req_pool_idx * ratio + position % ratio`` per token.
++    """Pending-ring slot ``req_pool_idx * stride + position % stride`` per token.
+     On extend, tokens before the pending tail dump into rows [0, ratio),
+     which no request owns (request slot 0 is never allocated); CUDA-graph safe."""
+     rows = token_to_batch_idx.long()[: logical_positions.numel()]
+     requests = req_pool_indices.long()[rows]
+     positions = logical_positions.long()
+-    slots = requests * compress_ratio + positions % compress_ratio
++    stride = compress_ratio if ring_stride is None else ring_stride
++    slots = requests * stride + positions % stride
+     if is_extend:
+         lengths = sequence_lengths.long()[rows]
+         pending = positions >= (lengths // compress_ratio) * compress_ratio
+@@ -280,6 +282,7 @@ def build_group_ring_slots(
+     group_end_positions: torch.Tensor,
+     sequence_ids: torch.Tensor,
+     compress_ratio: int,
++    ring_stride: int | None = None,
+ ) -> torch.Tensor:
+     """Ring slots of a planned group's members, oldest first."""
+     requests = req_pool_indices.long()[sequence_ids]
+@@ -291,7 +294,8 @@ def build_group_ring_slots(
+         dtype=torch.long,
+     )
+     positions = (group_end_positions[:, None] - offsets[None, :]).clamp_min(0)
+-    return requests[:, None] * compress_ratio + positions % compress_ratio
++    stride = compress_ratio if ring_stride is None else ring_stride
++    return requests[:, None] * stride + positions % stride
+
+
+ def build_rope_position_matrix(
+diff --git a/python/sglang/srt/layers/attention/qsa/qsa_indexer.py b/python/sglang/srt/layers/attention/qsa/qsa_indexer.py
+index ae9a23784e..b34c553743 100644
+--- a/python/sglang/srt/layers/attention/qsa/qsa_indexer.py
++++ b/python/sglang/srt/layers/attention/qsa/qsa_indexer.py
+@@ -294,6 +294,7 @@ class QSAIndexer(MultiPlatformOp):
+             sequence_lengths=metadata.sequence_lengths,
+             logical_positions=logical_positions,
+             compress_ratio=self.compress_ratio,
++            ring_stride=getattr(metadata.token_to_kv_pool, "qsa_ring_stride", self.compress_ratio),
+             is_extend=is_extend,
+         )
+
+@@ -305,6 +306,7 @@ class QSAIndexer(MultiPlatformOp):
+             group_end_positions=group_end_positions,
+             sequence_ids=sequence_ids,
+             compress_ratio=self.compress_ratio,
++            ring_stride=getattr(metadata.token_to_kv_pool, "qsa_ring_stride", self.compress_ratio),
+         )
+
+     def update_key_state_and_compress(
+diff --git a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+index fb24478546..921ee6b2f8 100644
+--- a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
++++ b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+@@ -831,6 +831,7 @@ class QwenSparseAttnBackend(AttentionBackend):
+                 sequence_lengths=sequence_lengths,
+                 logical_positions=ring_logical_positions,
+                 compress_ratio=self.compress_ratio,
++                ring_stride=getattr(self.token_to_kv_pool, "qsa_ring_stride", self.compress_ratio),
+                 is_extend=group_member_rows is not None,
+             )
+             if write_locs.numel():
+@@ -849,6 +850,7 @@ class QwenSparseAttnBackend(AttentionBackend):
+                         group_end_positions=group_positions.long(),
+                         sequence_ids=group_sequence_ids.long(),
+                         compress_ratio=self.compress_ratio,
++                        ring_stride=getattr(self.token_to_kv_pool, "qsa_ring_stride", self.compress_ratio),
+                     )
+         indexer_metadata = QSAIndexerMetadata(
+             sequence_lengths=sequence_lengths,
+@@ -1392,6 +1394,7 @@ class QwenSparseAttnBackend(AttentionBackend):
+                 sequence_lengths=metadata.sequence_lengths,
+                 logical_positions=current_positions,
+                 compress_ratio=ratio,
++                ring_stride=getattr(pool, "qsa_ring_stride", ratio),
+                 is_extend=False,
+             )
+         )
+@@ -1401,6 +1404,7 @@ class QwenSparseAttnBackend(AttentionBackend):
+                 group_end_positions=current_positions,
+                 sequence_ids=metadata.token_to_batch_idx.long(),
+                 compress_ratio=ratio,
++                ring_stride=getattr(pool, "qsa_ring_stride", ratio),
+             ).to(torch.int32)
+         )
+
+@@ -1848,7 +1852,8 @@ class QwenSparseAttnBackend(AttentionBackend):
+                 _is_npu
+                 and os.getenv("SGLANG_NPU_QSA_PREFILL_GBSA", "0") == "1"
+                 and q.shape[0] >= 128
+-                and q.shape[1:] == (3, 256)
++                and q.shape[1:] in ((3, 256), (6, 256))
++                and layer.tp_k_head_num == layer.tp_v_head_num == 1
+                 and q.dtype == torch.bfloat16
+                 and (
+                     topk_indices.shape[1] == 2051
+@@ -2468,7 +2473,8 @@ class QwenSparseAttnBackend(AttentionBackend):
+         if not (
+             os.getenv("SGLANG_NPU_QSA_PAGED_GBSA", "0") == "1"
+             and q.shape[0] > 0
+-            and q.shape[1:] == (3, 256)
++            and q.shape[1:] in ((3, 256), (6, 256))
++            and k.shape[-2] == v.shape[-2] == 1
+             and q.dtype == k.dtype == v.dtype == torch.bfloat16
+             and groups.shape == (q.shape[0], 512)
+             and self.compress_ratio == 4
+diff --git a/python/sglang/srt/layers/logprob_processor.py b/python/sglang/srt/layers/logprob_processor.py
+index da4d510df8..99f2435f48 100644
+--- a/python/sglang/srt/layers/logprob_processor.py
++++ b/python/sglang/srt/layers/logprob_processor.py
+@@ -90,7 +90,8 @@ def compute_row_log_normalizer(
+     shift-invariant order as log-softmax; a single absolute normalizer would
+     round the log_sum term away for rows with a large common offset.
+     """
+-    if logits.is_cuda:
++    # NPU compatibility mode also reports Tensor.is_cuda on NPU tensors.
++    if logits.device.type == "cuda":
+         from sglang.srt.layers.logsumexp import row_logsumexp
+
+         return row_logsumexp(logits)
+@@ -826,7 +827,7 @@ class InputLogprobProcessor:
+         split_len_token_ids = 0
+
+         fused_kernel, fused_max_k = None, 0
+-        if self.enable_fast_input_logprobs and pruned_states.is_cuda:
++        if self.enable_fast_input_logprobs and pruned_states.device.type == "cuda":
+             from sglang.srt.layers.logsumexp import (
+                 FUSED_TOPK_MAX_K,
+                 row_logsumexp_topk,
+diff --git a/python/sglang/srt/layers/moe/token_dispatcher/ascend_ops.py b/python/sglang/srt/layers/moe/token_dispatcher/ascend_ops.py
+index 40589256f8..101a16191e 100644
+--- a/python/sglang/srt/layers/moe/token_dispatcher/ascend_ops.py
++++ b/python/sglang/srt/layers/moe/token_dispatcher/ascend_ops.py
+@@ -424,9 +424,9 @@ class AscendOpsDispatcher(BaseDispatcher):
+
+         world_size = dist.get_world_size(group)
+         local_rows_tensor = torch.tensor([local_rows], dtype=torch.int64, device=device)
+-        gathered_rows = [torch.empty_like(local_rows_tensor) for _ in range(world_size)]
+-        dist.all_gather(gathered_rows, local_rows_tensor, group=group)
+-        return [int(rows.item()) for rows in gathered_rows]
++        gathered_rows = local_rows_tensor.new_empty((world_size,))
++        dist.all_gather_into_tensor(gathered_rows, local_rows_tensor, group=group)
++        return gathered_rows.tolist()
+
+     def _resolve_allgather_row_sizes(self, local_rows: int, group, device) -> list[int]:
+         row_sizes = get_forward().ascend_allgather_row_sizes
+diff --git a/python/sglang/srt/mem_cache/kv_cache_configurator.py b/python/sglang/srt/mem_cache/kv_cache_configurator.py
+index 6e15baebe3..d1b4589d4e 100644
+--- a/python/sglang/srt/mem_cache/kv_cache_configurator.py
++++ b/python/sglang/srt/mem_cache/kv_cache_configurator.py
+@@ -2946,6 +2946,11 @@ class KVCacheConfigurator:
+                 qsa_index_kv_heads=qsa_profile.kv_heads,
+                 qsa_index_head_dim=qsa_profile.head_dim,
+                 qsa_compress_ratio=qsa_profile.compress_ratio,
++                qsa_verify_width=(
++                    (max_speculative_num_draft_tokens() or 1)
++                    if _is_npu and get_disagg().disaggregation_mode == "null"
++                    else 1
++                ),
+                 qsa_token_topk=qsa_profile.budget,
+                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
+                 qsa_indexer_dtype=resolve_qsa_indexer_dtype(qsa_indexer_dtype),
+diff --git a/python/sglang/srt/mem_cache/qsa_kv_pool.py b/python/sglang/srt/mem_cache/qsa_kv_pool.py
+index d38506cbd2..d136628b2b 100644
+--- a/python/sglang/srt/mem_cache/qsa_kv_pool.py
++++ b/python/sglang/srt/mem_cache/qsa_kv_pool.py
+@@ -111,6 +111,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
+         qsa_compress_ratio: int,
+         qsa_token_topk: int,
+         num_request_slots: int,
++        qsa_verify_width: int = 1,
+         enable_memory_saver: bool = False,
+         enable_kv_cache_copy: bool = False,
+         start_layer: Optional[int] = None,
+@@ -191,16 +192,18 @@ class QSATokenToKVPool(HybridLinearKVPool):
+         # seen by the scoring kernels is one full-KV page's worth of groups.
+         self.qsa_compressed_page_size = page_size // self.qsa_compress_ratio
+         self.qsa_compressed_capacity = -(state_size // -self.qsa_compress_ratio)
+-        # Pre-compression index-K state is a per-request ring, not a per-token cache:
+-        # only the pending group's ``ratio`` members must survive a forward,
+-        # addressed as ``req_pool_idx * ratio + position % ratio``.
+-        # Request slot 0 is never allocated, so rows [0, ratio) are the inert dump.
++        # Keep the unfinished compression group and every speculative row alive
++        # until the accepted prefix is known. Request slot zero holds padding.
++        if qsa_verify_width < 1:
++            raise ValueError("QSA verify width must be positive")
++        ratio = self.qsa_compress_ratio
++        self.qsa_ring_stride = ((qsa_verify_width + 2 * ratio - 2) // ratio) * ratio
+         if num_request_slots <= 0:
+             raise ValueError(
+                 f"QSA pending ring needs request slots, got {num_request_slots}"
+             )
+         self.qsa_num_request_slots = int(num_request_slots)
+-        ring_slots = self.qsa_num_request_slots * self.qsa_compress_ratio
++        ring_slots = self.qsa_num_request_slots * self.qsa_ring_stride
+         # These buffers participate in Mooncake PD transfer just like the base
+         # KV and Mamba pools.  Keep their allocation in the same memory-saver
+         # and Mooncake custom-pool regions; otherwise MNNVL cannot resolve the
+@@ -252,6 +255,14 @@ class QSATokenToKVPool(HybridLinearKVPool):
+             )
+             for layer_offset in range(len(full_attention_layer_ids))
+         ]
++        if self.qsa_ring_stride > self.qsa_compress_ratio:
++            logger.info(
++                "QSA pending ring: stride=%d, request_slots=%d, rows=%d, verify_width=%d",
++                self.qsa_ring_stride,
++                self.qsa_num_request_slots,
++                self.qsa_rope_position_buffer.shape[0],
++                qsa_verify_width,
++            )
+         k_size, v_size = self.get_kv_size_bytes()
+         self.mem_usage = (k_size + v_size) / GB
+
+@@ -313,7 +324,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
+         tensors = [*self.qsa_key_state_buffer_pool, self.qsa_rope_position_buffer]
+         return self._get_paged_state_buf_infos(
+             tensors,
+-            self.qsa_compress_ratio,
++            self.qsa_ring_stride,
+         )
+
+     def get_qsa_pending_state_layer_ids(self):
