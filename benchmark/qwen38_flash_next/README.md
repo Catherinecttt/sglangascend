@@ -63,3 +63,22 @@ PYTHONPATH="$PWD/../sglang-tp16/python${PYTHONPATH:+:$PYTHONPATH}" bash benchmar
 ```
 
 原来的 `bench.sh` 可以直接测 32 并发。历史上，同一服务处理随附的 32 条文本、每条输出 4096 token，单轮耗时 **94.47 秒**。将这组输入重复两份，以 64 并发发送 64 条请求，后两轮平均 **123.32 秒**，输出吞吐 **2125.83 token/s**。
+
+## 5. 固定的纯文本和图文混合输入
+
+`serving_benchmark_v1.zip` 包含 A、B、C、D 四组互不重叠的合成请求。每组可取 32 到 256 条，步长为 32。每批一半纯文本、一半带图片，平均输入约 10,720 token，最长 29,990 token，每条固定输出 4,096 token。
+
+在仓库根目录运行以下命令。脚本会校验 ZIP 并展开全部 32 份 JSONL。用 IDE 打开 `serving_benchmark_v1/A032.jsonl` 或 `D032.jsonl`，每行是一条完整请求，图片路径相对于 JSONL 所在目录。
+
+```bash
+cd benchmark/qwen38_flash_next
+python3 unpack_mixed.py
+```
+
+测速时，使用支持图文的服务，上下文至少设为 34,086 token，并安装 `aiohttp`。将 `BASE_URL` 设为以 `/v1` 结尾的 API 地址，`MODEL` 设为服务暴露的模型名。在刚才的目录运行以下命令。
+
+```bash
+python3 serving_benchmark_v1/bench.py --base-url "$BASE_URL" --model "$MODEL" --batch A032 --out result-A032.json
+```
+
+跨机器比较时，选择同一批次，关闭前缀缓存和图片 embedding 缓存，用独立请求预热。客户端会逐条核对服务端返回的输入和输出 token 数。
