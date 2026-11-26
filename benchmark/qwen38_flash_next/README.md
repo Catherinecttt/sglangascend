@@ -68,17 +68,25 @@ PYTHONPATH="$PWD/../sglang-tp16/python${PYTHONPATH:+:$PYTHONPATH}" bash benchmar
 
 `serving_benchmark_v1.zip` 包含 A、B、C、D 四组互不重叠的合成请求。每组可取 32 到 256 条，步长为 32。每批一半纯文本、一半带图片，平均输入约 10,720 token，最长 29,990 token，每条固定输出 4,096 token。
 
-在仓库根目录运行以下命令。脚本会校验 ZIP 并展开全部 32 份 JSONL。用 IDE 打开 `serving_benchmark_v1/A032.jsonl` 或 `D032.jsonl`，每行是一条完整请求，图片路径相对于 JSONL 所在目录。
+在仓库根目录运行以下命令。脚本校验 ZIP，一次生成 32 份供 IDE 查看原文的 JSONL 和 4 份供官方测速的 JSONL。已解包过的目录可以直接重跑。
 
 ```bash
 cd benchmark/qwen38_flash_next
 python3 unpack_mixed.py
 ```
 
-测速时，使用支持图文的服务，上下文至少设为 34,086 token，并安装 `aiohttp`。将 `BASE_URL` 设为以 `/v1` 结尾的 API 地址，`MODEL` 设为服务暴露的模型名。在刚才的目录运行以下命令。
+用 IDE 打开 `serving_benchmark_v1/A032.jsonl` 或同目录的 `D032.jsonl`。每行是一条完整请求，图片路径相对于该文件。
+
+测速使用支持图文的服务，上下文至少设为 34,086 token。在刚才的目录运行以下命令，以 32 并发测 A 组前 32 条。测速文件内嵌原图，客户端可以在另一台机器上运行。
 
 ```bash
-python3 serving_benchmark_v1/bench.py --base-url "$BASE_URL" --model "$MODEL" --batch A032 --out result-A032.json
+python3 -m sglang.benchmark.serving --backend sglang-oai-chat \
+  --host localhost --port "${PORT:-30000}" \
+  --dataset-name openai --dataset-path serving_benchmark_v1/openai/A.jsonl \
+  --num-prompts 32 --max-concurrency 32 --request-rate inf --warmup-requests 0 \
+  --output-details --output-file result-A032.jsonl
 ```
 
-跨机器比较时，选择同一批次，关闭前缀缓存和图片 embedding 缓存，用独立请求预热。客户端会逐条核对服务端返回的输入和输出 token 数。
+测 A64 时，把请求数和并发都改为 64，结果写到 `result-A064.jsonl`。换组时选择同目录的 `B.jsonl`、`C.jsonl` 或 `D.jsonl`。远端服务可用 `--base-url` 指定服务根地址（到端口为止），用 `--tokenizer` 指定客户端可读的 tokenizer。
+
+跨机器比较时，选择同一组和同一请求数，关闭前缀缓存和图片 embedding 缓存，用独立请求预热。以 A32 为例，结果明细的 `input_lens` 合计应为 343,220，`output_lens` 应为 32 个 4,096。`input_lens` 应和 `A032.jsonl` 中逐条的 `input_tokens` 对齐，加载数据时打印的输入估算只计算了图片占位符和文本。
