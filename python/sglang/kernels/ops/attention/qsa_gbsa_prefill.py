@@ -7,38 +7,38 @@ Token tables must map aligned 128-token logical pages to physical KV pages.
 """
 import logging
 import os
-from contextvars import ContextVar
-from functools import lru_cache, wraps
+from functools import lru_cache
 
 import torch
-
-
-_paged_cache = ContextVar("qsa_paged_gbsa_cache", default=None)
-
-
-def with_paged_gbsa_cache(forward):
-    flags = ("SGLANG_NPU_QSA_REUSE_GBSA_META", "SGLANG_NPU_QSA_PAGED_GBSA",
-             "SGLANG_NPU_QSA_LIGHTNING_INDEXER")
-    if not all(os.getenv(flag, "0") == "1" for flag in flags):
-        return forward
-
-    @wraps(forward)
-    def run(self, input_ids, positions, forward_batch, *args, **kwargs):
-        mode = forward_batch.forward_mode
-        active = mode.is_decode() or mode.is_target_verify()
-        token = _paged_cache.set({} if active else None)
-        try:
-            return forward(self, input_ids, positions, forward_batch, *args, **kwargs)
-        finally:
-            _paged_cache.reset(token)
-
-    return run
 
 
 @lru_cache(maxsize=1)
 def _report_native():
     logging.getLogger(__name__).info(
         "QSA prefill uses CANN GBSA: D256, block [1,4], KV page128, residual mode1"
+    )
+
+
+def _gbsa_options(cu_q, seq_lens):
+    return dict(
+        cu_seqlens_q=cu_q, seqused_kv=seq_lens.to(torch.int32).contiguous(),
+        layout_q="TND", layout_kv="PA_BBND", layout_sparse_pattern=4,
+        mask_mode=1, quant_mode=0, softmax_precision=0,
+        residual_block_mode=1, is_consistent_topk=False,
+    )
+
+
+def prepare_gbsa_metadata(block_lengths, cu_q, seq_lens, max_query, max_kv):
+    from sgl_kernel_npu.operators.attention import generic_block_sparse_attention_metadata
+
+    counts = block_lengths.clamp(0, 512).to(torch.int32).view(1, -1)
+    # CANN 9.2 A3 uses the int32 index tensor's shape and reads the count values.
+    # Per-layer selected IDs are supplied only to the attention consumer.
+    index_shape = counts.new_empty((1, counts.shape[1], 512))
+    return generic_block_sparse_attention_metadata(
+        index_shape, counts, 3, 1, 256, [1, 4],
+        max_seqlen_q=max_query, max_seqlen_kv=max_kv,
+        **_gbsa_options(cu_q, seq_lens),
     )
 
 
@@ -56,9 +56,7 @@ def qsa_gbsa_prefill(
     indices_are_blocks=False,
     page_table=None,
     cu_seqlens_q=None,
-    meta_cache=None,
-    span=None,
-    paged_step=None,
+    prepared_meta=None,
 ):
     from sgl_kernel_npu.operators.attention import (
         generic_block_sparse_attention,
@@ -104,40 +102,13 @@ def qsa_gbsa_prefill(
         if cu_seqlens_q is None else cu_seqlens_q
     )
     assert cu_q.dtype == torch.int64
-    options = dict(cu_seqlens_q=cu_q, seqused_kv=seq_lens.to(torch.int32).contiguous(),
-                   layout_q='TND', layout_kv='PA_BBND', layout_sparse_pattern=4,
-                   mask_mode=1, quant_mode=0, softmax_precision=0,
-                   residual_block_mode=1, is_consistent_topk=False)
-    max_kv = table.shape[1] * 128
-
-    def build_meta():
-        cache = _paged_cache.get() if paged_step is not None else None
-        if cache is not None:
-            key = (id(paged_step), q.device, ids.shape, ids.dtype, max_query, max_kv)
-            if key in cache:
-                return cache[key]
+    options = _gbsa_options(cu_q, seq_lens)
+    meta = prepared_meta
+    if meta is None:
         meta = generic_block_sparse_attention_metadata(
             ids, counts, 3, 1, 256, [1, 4],
-            max_seqlen_q=max_query, max_seqlen_kv=max_kv, **options,
+            max_seqlen_q=max_query, max_seqlen_kv=table.shape[1] * 128, **options,
         )
-        if cache is not None:
-            cache[key] = meta
-        return meta
-
-    # Within this forward and span, cu_q, sequence lengths, layouts and head
-    # geometry are shared. The per-layer selected IDs still go to attention.
-    reuse = meta_cache is not None and indices_are_blocks
-    entry = None
-    if reuse:
-        key = (span, q.device, max_query, max_kv, ids.shape, ids.dtype)
-        entry = meta_cache.get(key)
-    hit = entry is not None and torch.equal(counts, entry[0])
-    if hit:
-        meta = entry[1]
-    else:
-        meta = build_meta()
-        if reuse:
-            meta_cache[key] = (counts, meta)
 
     output, _ = generic_block_sparse_attention(
         q.contiguous(), k.view(-1, 128, 1, 256), v.view(-1, 128, 1, 256), ids,
@@ -146,8 +117,3 @@ def qsa_gbsa_prefill(
         return_softmax_lse=False, **options,
     )
     return output
-
-
-@lru_cache(maxsize=1)
-def _report_verified_reuse():
-    logging.getLogger(__name__).info("QSA GBSA: first reused metadata output matched fresh metadata")
