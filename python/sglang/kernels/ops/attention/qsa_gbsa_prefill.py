@@ -7,9 +7,32 @@ Token tables must map aligned 128-token logical pages to physical KV pages.
 """
 import logging
 import os
-from functools import lru_cache
+from contextvars import ContextVar
+from functools import lru_cache, wraps
 
 import torch
+
+
+_paged_cache = ContextVar("qsa_paged_gbsa_cache", default=None)
+
+
+def with_paged_gbsa_cache(forward):
+    flags = ("SGLANG_NPU_QSA_REUSE_GBSA_META", "SGLANG_NPU_QSA_PAGED_GBSA",
+             "SGLANG_NPU_QSA_LIGHTNING_INDEXER")
+    if not all(os.getenv(flag, "0") == "1" for flag in flags):
+        return forward
+
+    @wraps(forward)
+    def run(self, input_ids, positions, forward_batch, *args, **kwargs):
+        mode = forward_batch.forward_mode
+        active = mode.is_decode() or mode.is_target_verify()
+        token = _paged_cache.set({} if active else None)
+        try:
+            return forward(self, input_ids, positions, forward_batch, *args, **kwargs)
+        finally:
+            _paged_cache.reset(token)
+
+    return run
 
 
 @lru_cache(maxsize=1)
@@ -33,6 +56,9 @@ def qsa_gbsa_prefill(
     indices_are_blocks=False,
     page_table=None,
     cu_seqlens_q=None,
+    meta_cache=None,
+    span=None,
+    paged_step=None,
 ):
     from sgl_kernel_npu.operators.attention import (
         generic_block_sparse_attention,
@@ -82,11 +108,46 @@ def qsa_gbsa_prefill(
                    layout_q='TND', layout_kv='PA_BBND', layout_sparse_pattern=4,
                    mask_mode=1, quant_mode=0, softmax_precision=0,
                    residual_block_mode=1, is_consistent_topk=False)
-    meta = generic_block_sparse_attention_metadata(
-        ids, counts, 3, 1, 256, [1,4], max_seqlen_q=max_query,
-        max_seqlen_kv=table.shape[1] * 128, **options)
+    max_kv = table.shape[1] * 128
+
+    def build_meta():
+        cache = _paged_cache.get() if paged_step is not None else None
+        if cache is not None:
+            key = (id(paged_step), q.device, ids.shape, ids.dtype, max_query, max_kv)
+            if key in cache:
+                return cache[key]
+        meta = generic_block_sparse_attention_metadata(
+            ids, counts, 3, 1, 256, [1, 4],
+            max_seqlen_q=max_query, max_seqlen_kv=max_kv, **options,
+        )
+        if cache is not None:
+            cache[key] = meta
+        return meta
+
+    # Within this forward and span, cu_q, sequence lengths, layouts and head
+    # geometry are shared. The per-layer selected IDs still go to attention.
+    reuse = meta_cache is not None and indices_are_blocks
+    entry = None
+    if reuse:
+        key = (span, q.device, max_query, max_kv, ids.shape, ids.dtype)
+        entry = meta_cache.get(key)
+    hit = entry is not None and torch.equal(counts, entry[0])
+    if hit:
+        meta = entry[1]
+    else:
+        meta = build_meta()
+        if reuse:
+            meta_cache[key] = (counts, meta)
+
     output, _ = generic_block_sparse_attention(
-        q.contiguous(), k.view(-1,128,1,256), v.view(-1,128,1,256), ids,
-        counts, [1,4], metadata=meta, block_table=table, softmax_scale=1/16 if softmax_scale is None else softmax_scale,
-        return_softmax_lse=False, **options)
+        q.contiguous(), k.view(-1, 128, 1, 256), v.view(-1, 128, 1, 256), ids,
+        counts, [1, 4], metadata=meta, block_table=table,
+        softmax_scale=1/16 if softmax_scale is None else softmax_scale,
+        return_softmax_lse=False, **options,
+    )
     return output
+
+
+@lru_cache(maxsize=1)
+def _report_verified_reuse():
+    logging.getLogger(__name__).info("QSA GBSA: first reused metadata output matched fresh metadata")

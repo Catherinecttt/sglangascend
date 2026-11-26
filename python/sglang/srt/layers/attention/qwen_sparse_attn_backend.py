@@ -220,6 +220,7 @@ class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
     # KV-sharded extend.
     kv_shard_slot_table: Optional[torch.Tensor] = None
     npu_prefill_inputs: Optional[object] = None
+    gbsa_meta_cache: Optional[dict] = None
 
 
 class QSAMTPSharedSparseIndices:
@@ -878,19 +879,20 @@ class QwenSparseAttnBackend(AttentionBackend):
             ),
             prefill_sequence_lengths_cpu=prefill_sequence_lengths_cpu,
         )
+        prefill_inputs, gbsa_meta_cache = self._prepare_npu_prefill_state(
+            forward_batch, sequence_lengths, token_slot_table, token_to_batch_idx.numel()
+        )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,
             token_to_batch_idx=token_to_batch_idx,
             token_slot_table=token_slot_table,
             indexer_metadata=indexer_metadata,
             row_req_pool_indices=row_req_pool_indices,
-            npu_prefill_inputs=self._make_npu_prefill_inputs(
-                forward_batch, sequence_lengths, token_slot_table,
-                token_to_batch_idx.numel(),
-            ),
+            npu_prefill_inputs=prefill_inputs,
+            gbsa_meta_cache=gbsa_meta_cache,
         )
 
-    def _make_npu_prefill_inputs(self, batch, lengths, token_table, rows):
+    def _prepare_npu_prefill_state(self, batch, lengths, token_table, rows):
         if not (
             _is_npu
             and os.getenv("SGLANG_NPU_QSA_VA_PREFILL_DISPATCH", "0") == "1"
@@ -901,19 +903,23 @@ class QwenSparseAttnBackend(AttentionBackend):
             and batch.extend_seq_lens_cpu is not None
             and rows >= 128
         ):
-            return None
+            return None, None
         from sglang.kernels.ops.attention.qsa_prefill_dispatch_va import (
             prepare_sg_prefill_inputs,
         )
 
         positions = batch.positions
         positions = positions[0] if positions.ndim == 2 else positions
-        return prepare_sg_prefill_inputs(
+        inputs = prepare_sg_prefill_inputs(
             batch.seq_lens_cpu[: lengths.numel()],
             batch.extend_seq_lens_cpu[: lengths.numel()],
             lengths, batch.extend_seq_lens, token_table,
             positions.flatten()[:rows],
         )
+        # A fresh cache for this forward only. Keep the original routing sentinel:
+        # inputs is None for pure GBSA, even when the cache is enabled.
+        cache = {} if os.getenv("SGLANG_NPU_QSA_REUSE_GBSA_META", "0") == "1" else None
+        return inputs, cache
 
     def init_forward_metadata(self, forward_batch):
         if self._cp_kv_pending is not None:
@@ -1869,6 +1875,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                         _flatten_qsa_kv_cache(pool.layer_router.read(layer.layer_id).key(), "key"),
                         _flatten_qsa_kv_cache(pool.layer_router.read(layer.layer_id).value(), "value"),
                         topk_indices, metadata.npu_prefill_inputs, layer.scaling,
+                        meta_cache=metadata.gbsa_meta_cache,
                     )
                     return self._pad_extend_output(output, num_output_rows)
                 # Keep original sequence boundaries: GBSA computes all selected
@@ -1884,6 +1891,11 @@ class QwenSparseAttnBackend(AttentionBackend):
                     q.shape[0],
                     layer.scaling,
                     indices_are_blocks=self._uses_block_indices(topk_indices),
+                    meta_cache=(
+                        metadata.gbsa_meta_cache
+                        if num_valid_rows == metadata.token_to_batch_idx.numel()
+                        else None
+                    ),
                 )
                 return self._pad_extend_output(output, num_output_rows)
             # The token consumer can fuse compact expansion with slot mapping.
@@ -2497,6 +2509,13 @@ class QwenSparseAttnBackend(AttentionBackend):
             q, _flatten_qsa_kv_cache(k, "key"), _flatten_qsa_kv_cache(v, "value"),
             groups, None, lengths, None, 1, scale,
             indices_are_blocks=True, page_table=pages, cu_seqlens_q=cu_q,
+            paged_step=(
+                metadata
+                if indexer.defer_block_expansion
+                and self._mtp_shared_sparse_indices is None
+                and self.token_to_kv_pool.qsa_compressed_dtype == torch.bfloat16
+                else None
+            ),
         )
 
 
