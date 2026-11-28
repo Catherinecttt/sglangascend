@@ -118,6 +118,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 if _is_npu:
     from sgl_kernel_npu.operators.mamba import short_conv as ple_short_conv
+    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
@@ -1322,7 +1323,7 @@ class Qwen4ExpPLELayer(nn.Module):
                 )
                 conv_input = torch.cat([state, x.unsqueeze(-1)], dim=-1)
             # The NPU kernel is graph-capturable and returns [B, C] directly.
-            if _is_npu:
+            if _is_npu and not is_npu_arch35():
                 conv_output = ple_short_conv(
                     conv_input,
                     self.conv1d.weight.to(dtype=x.dtype),
@@ -1355,7 +1356,11 @@ class Qwen4ExpPLELayer(nn.Module):
         conv_input = torch.cat([state, padded_seq.transpose(1, 2)], dim=-1)
         # Decode/verify use the graph-capturable NPU kernel. Its output is
         # already [B, W, C]; ordinary prefill retains native convolution.
-        if _is_npu and (batch.mode.is_target_verify() or batch.mode.is_decode()):
+        if (
+            _is_npu
+            and (batch.mode.is_target_verify() or batch.mode.is_decode())
+            and not is_npu_arch35()
+        ):
             conv_output = ple_short_conv(
                 conv_input,
                 self.conv1d.weight.to(dtype=x.dtype),
